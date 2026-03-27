@@ -327,6 +327,7 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         kv_ratio=3.0,
         local_range = 9,
         color_fix = True,
+        color_fix_method = 'wavelet',
         unload_dit = False,
         force_offload = False,
         enable_debug_logging = False,
@@ -560,7 +561,7 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                             cur_LQ_frame,
                             clip_range=(-1, 1),
                             chunk_size=None,
-                            method='adain'
+                            method=color_fix_method
                         )
                 except:
                     pass

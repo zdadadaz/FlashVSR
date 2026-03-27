@@ -16,11 +16,15 @@ Registry Link: https://registry.comfy.org/publishers/naxci1/nodes/ComfyUI-FlashV
 ## ✨ Key Features
 
 - **🎬 Video Super Resolution**: 2x or 4x upscaling using FlashVSR diffusion models
+- **🖼️ Image Super Resolution**: Single image upscaling via FlashVSR (25-frame temporal replication)
+- **📁 Batch Video Processing**: Load and iterate through all videos in a directory
 - **🧠 5 VAE Options**: Choose from Wan2.1, Wan2.2, LightVAE, TAE variants for optimal VRAM/quality trade-off
+- **🎨 Color Fix Methods**: Wavelet (recommended, no ghosting) or AdaIN (adaptive instance normalization)
 - **📊 Pre-Flight Resource Check**: Intelligent VRAM estimation with settings recommendations
 - **⚡ Auto-Download**: Models download automatically from HuggingFace if missing
 - **🛡️ OOM Protection**: Automatic recovery with progressive fallback (tiled VAE → tiled DiT → chunking)
 - **🔧 Unified Pipeline**: All modes share optimized processing logic
+- **🔍 Local Range Control**: Choose 7 (sharpest), 9 (balanced), or 11 (most stable) attention window
 
 ---
 

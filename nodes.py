@@ -1001,7 +1001,7 @@ class cqdm:
     def __len__(self):
         return self.total
 
-def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug, is_single_frame_input=False):
+def process_chunk(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug, is_single_frame_input=False):
     """
     Processes a single chunk of frames.
     
@@ -1063,7 +1063,7 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
                 prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
                 progress_bar_cmd=cqdm_tile, LQ_video=LQ_tile, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
                 topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
-                color_fix=color_fix, unload_dit=unload_dit, force_offload=force_offload,
+                color_fix=color_fix, color_fix_method=color_fix_method, unload_dit=unload_dit, force_offload=force_offload,
                 enable_debug_logging=enable_debug
             )
             
@@ -1129,7 +1129,7 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
             prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
             progress_bar_cmd=cqdm_debug, LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
             topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
-            color_fix = color_fix, unload_dit=unload_dit, force_offload=force_offload,
+            color_fix = color_fix, color_fix_method = color_fix_method, unload_dit=unload_dit, force_offload=force_offload,
             enable_debug_logging=enable_debug
         )
 
@@ -1166,7 +1166,7 @@ def process_chunk(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_siz
 
     return final_output[:frames.shape[0], :, :, :]
 
-def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug=False, chunk_size=0, resize_factor=1.0, mode="full"):
+def flashvsr(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, force_offload, enable_debug=False, chunk_size=0, resize_factor=1.0, mode="full"):
     """
     =============================================================================
     FIX 9 & 10: Unified Processing Pipeline with Pre-Flight Check
@@ -1289,7 +1289,7 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
             while retry_count <= max_retries:
                 try:
                     chunk_out = process_chunk(
-                        pipe, chunk_frames, scale, color_fix, current_tiled_vae, current_tiled_dit,
+                        pipe, chunk_frames, scale, color_fix, color_fix_method, current_tiled_vae, current_tiled_dit,
                         tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio,
                         local_range, seed, force_offload, enable_debug,
                         is_single_frame_input=is_single_frame_input
@@ -1324,7 +1324,7 @@ def flashvsr(pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, ti
         while retry_count <= max_retries:
             try:
                 final_output_tensor = process_chunk(
-                    pipe, frames, scale, color_fix, current_tiled_vae, current_tiled_dit,
+                    pipe, frames, scale, color_fix, color_fix_method, current_tiled_vae, current_tiled_dit,
                     tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio,
                     local_range, seed, force_offload, enable_debug,
                     is_single_frame_input=is_single_frame_input
@@ -1470,7 +1470,11 @@ class FlashVSRNodeAdv:
                 }),
                 "color_fix": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Apply wavelet-based color correction to match the output colors with the input, preventing color shifts."
+                    "tooltip": "Apply color correction to match the output colors with the input, preventing color shifts."
+                }),
+                "color_fix_method": (["wavelet", "adain"], {
+                    "default": "wavelet",
+                    "tooltip": 'Color correction method. "wavelet": no ghosting artifacts, recommended. "adain": adaptive instance normalization, may cause slight ghosting on some inputs.'
                 }),
                 "tiled_vae": ("BOOLEAN", {
                     "default": True,
@@ -1514,12 +1518,9 @@ class FlashVSRNodeAdv:
                     "display": "slider",
                     "tooltip": "Key/Value cache ratio. 1.0 uses less VRAM; 3.0 provides highest quality retention."
                 }),
-                "local_range": ("INT", {
-                    "default": 11,
-                    "min": 9,
-                    "max": 11,
-                    "step": 2,
-                    "tooltip": "Local attention range window. 9 = sharper details; 11 = more stable/consistent results."
+                "local_range": (["7 (sharpest)", "9 (balanced)", "11 (most stable)"], {
+                    "default": "9 (balanced)",
+                    "tooltip": "Local attention range window. 7 = sharpest details (may be less stable); 9 = balanced; 11 = most stable/consistant."
                 }),
                 "seed": ("INT", {
                     "default": 0,
@@ -1557,7 +1558,9 @@ class FlashVSRNodeAdv:
     FUNCTION = "main"
     CATEGORY = "FlashVSR"
     
-    def main(self, pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, frame_chunk_size, enable_debug, keep_models_on_cpu, resize_factor):
+    def main(self, pipe, frames, scale, color_fix, color_fix_method, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, frame_chunk_size, enable_debug, keep_models_on_cpu, resize_factor):
+        # Extract local_range int from dropdown string
+        local_range_int = int(local_range.split(" ")[0])
         # FIX 10: Extract mode from pipe tuple for unified processing
         # Pipe tuple structure: (pipeline_object, force_offload, mode)
         # Backwards compatible with older 2-element tuples (pipeline, force_offload)
@@ -1566,7 +1569,7 @@ class FlashVSRNodeAdv:
         else:
             _pipe = pipe[0]
             mode = "full"  # Default fallback for backwards compatibility
-        output = flashvsr(_pipe, frames, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range, seed, keep_models_on_cpu, enable_debug, frame_chunk_size, resize_factor, mode=mode)
+        output = flashvsr(_pipe, frames, scale, color_fix, color_fix_method, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, sparse_ratio, kv_ratio, local_range_int, seed, keep_models_on_cpu, enable_debug, frame_chunk_size, resize_factor, mode=mode)
         return(output.cpu().float(),)
 
 class FlashVSRNode:
@@ -1599,6 +1602,14 @@ class FlashVSRNode:
                     "min": 2,
                     "max": 4,
                     "tooltip": "Upscaling factor. 2x or 4x."
+                }),
+                "color_fix": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Apply color correction to prevent color shifts. Recommended: ON."
+                }),
+                "color_fix_method": (["wavelet", "adain"], {
+                    "default": "wavelet",
+                    "tooltip": '"wavelet": no ghosting (recommended). "adain": may cause slight ghosting.'
                 }),
                 "tiled_vae": ("BOOLEAN", {
                     "default": True,
@@ -1653,7 +1664,7 @@ class FlashVSRNode:
     CATEGORY = "FlashVSR"
     DESCRIPTION = 'Single-node FlashVSR upscaling. 5 VAE options: Wan2.1, Wan2.2, LightVAE_W2.1, TAE_W2.2, LightTAE_HY1.5. Auto-downloads missing files.'
     
-    def main(self, model, frames, mode, vae_model, scale, tiled_vae, tiled_dit, unload_dit, seed, frame_chunk_size, attention_mode, enable_debug, keep_models_on_cpu, resize_factor):
+    def main(self, model, frames, mode, vae_model, scale, color_fix, color_fix_method, tiled_vae, tiled_dit, unload_dit, seed, frame_chunk_size, attention_mode, enable_debug, keep_models_on_cpu, resize_factor):
         _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "auto"
         if _device == "auto" or _device not in device_choices:
             raise RuntimeError("No devices found to run FlashVSR!")
@@ -1666,17 +1677,265 @@ class FlashVSRNode:
         # Use unified vae_model parameter    
         pipe = init_pipeline(model, mode, _device, torch.float16, vae_model=vae_model)
         # FIX 10: Pass mode for unified processing logic
-        output = flashvsr(pipe, frames, scale, True, tiled_vae, tiled_dit, 256, 24, unload_dit, 2.0, 3.0, 11, seed, keep_models_on_cpu, enable_debug, frame_chunk_size, resize_factor, mode=mode)
+        output = flashvsr(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, tiled_dit, 256, 24, unload_dit, 2.0, 3.0, 11, seed, keep_models_on_cpu, enable_debug, frame_chunk_size, resize_factor, mode=mode)
         return(output.cpu().float(),)
 
 NODE_CLASS_MAPPINGS = {
     "FlashVSRNode": FlashVSRNode,
     "FlashVSRNodeAdv": FlashVSRNodeAdv,
     "FlashVSRInitPipe": FlashVSRNodeInitPipe,
+    "FlashVSRNodeImageSR": FlashVSRNodeImageSR,
+    "FlashVSRNodeBatchPath": FlashVSRNodeBatchPath,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FlashVSRNode": "FlashVSR Ultra-Fast",
     "FlashVSRNodeAdv": "FlashVSR Ultra-Fast (Advanced)",
     "FlashVSRInitPipe": "FlashVSR Init Pipeline",
+    "FlashVSRNodeImageSR": "FlashVSR Image Super-Resolution",
+    "FlashVSRNodeBatchPath": "FlashVSR Batch Video Path Loader",
 }
+
+
+# =============================================================================
+# PR #2: Additional Features
+# - FlashVSRNodeImageSR: Single image super-resolution
+# - FlashVSRNodeBatchPath: Batch video processing from directory
+# =============================================================================
+
+class FlashVSRNodeImageSR:
+    """
+    Single image super-resolution using FlashVSR.
+    Converts input image to 25-frame video, processes, and outputs upscaled image.
+    Default output: 25 frames at 1 second (25fps).
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": (["FlashVSR", "FlashVSR-v1.1"], {
+                    "default": "FlashVSR-v1.1",
+                    "tooltip": "Select the FlashVSR model version. V1.1 is recommended."
+                }),
+                "mode": (["tiny", "tiny-long", "full"], {
+                    "default": "tiny",
+                    "tooltip": '"tiny": fast, "full": higher quality.'
+                }),
+                "vae_model": (VAE_MODEL_OPTIONS, {
+                    "default": "Wan2.1",
+                    "tooltip": 'VAE model. LightVAE_W2.1 uses less VRAM. Auto-downloads if missing.'
+                }),
+                "image": ("IMAGE", {
+                    "tooltip": "Input image to be upscaled. Will be repeated as 25 frames."
+                }),
+                "target_width": ("INT", {
+                    "default": 1280,
+                    "min": 128,
+                    "max": 8192,
+                    "step": 64,
+                    "tooltip": "Target output width. Image will be upscaled to this resolution."
+                }),
+                "target_height": ("INT", {
+                    "default": 768,
+                    "min": 128,
+                    "max": 8192,
+                    "step": 64,
+                    "tooltip": "Target output height. Image will be upscaled to this resolution."
+                }),
+                "scale": ("INT", {
+                    "default": 4,
+                    "min": 2,
+                    "max": 4,
+                    "tooltip": "Upscaling factor. 4x recommended (dataset was 4x trained)."
+                }),
+                "color_fix": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Apply color correction to prevent color shifts."
+                }),
+                "color_fix_method": (["wavelet", "adain"], {
+                    "default": "wavelet",
+                    "tooltip": '"wavelet": no ghosting (recommended). "adain": may cause slight ghosting.'
+                }),
+                "tiled_vae": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Enable spatial tiling for VAE. Reduces VRAM usage."
+                }),
+                "tiled_dit": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Enable spatial tiling for DiT. Crucial for large inputs."
+                }),
+                "seed": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 112589990684264,
+                    "tooltip": "Random seed for noise generation."
+                }),
+                "attention_mode": (["sparse_sage_attention", "block_sparse_attention", "flash_attention_2", "sdpa"], {
+                    "default": "sparse_sage_attention",
+                    "tooltip": 'Attention backend. "sparse_sage" is recommended.'
+                }),
+                "keep_models_on_cpu": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Move models to CPU RAM when not in use."
+                }),
+                "enable_debug": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Enable verbose logging."
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "main"
+    CATEGORY = "FlashVSR"
+    DESCRIPTION = "Single image super-resolution. Converts image to 25-frame video for FlashVSR processing, outputs upscaled image."
+
+    def main(self, model, mode, vae_model, image, target_width, target_height, scale, color_fix, color_fix_method, tiled_vae, tiled_dit, seed, attention_mode, keep_models_on_cpu, enable_debug):
+        _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "auto"
+        if _device == "auto":
+            raise RuntimeError("No GPU found for FlashVSR!")
+        if _device.startswith("cuda"):
+            torch.cuda.set_device(_device)
+
+        wan_video_dit.ATTENTION_MODE = attention_mode
+
+        # Prepare input: upscale tensor to target resolution first
+        # image shape from ComfyUI: (1, H, W, C), values 0-1 float
+        img_tensor = image[0]  # (H, W, C)
+        H, W = img_tensor.shape[0], img_tensor.shape[1]
+
+        # Upscale to target resolution using bicubic interpolation (scale=1 defers to FlashVSR's own scale)
+        if H != target_height or W != target_width:
+            # Resize to target dims before FlashVSR processing
+            img_tensor = tensor_upscale_then_center_crop(
+                img_tensor.unsqueeze(0), 1, target_width, target_height, 0, 0
+            ).squeeze(0)  # → (target_H, target_W, C)
+            log(f"Image resized from {W}x{H} to {target_width}x{target_height}", message_type='info', icon="🔧")
+
+        # Convert to 25 frames (1 second at 25fps) - FlashVSR needs temporal context
+        num_frames = 25
+        frames = img_tensor.unsqueeze(0).repeat(num_frames, 1, 1, 1)  # (25, H, W, C), values 0-1
+
+        # Move to device
+        frames = frames.to(_device)
+
+        # Initialize pipeline
+        pipe = init_pipeline(model, mode, _device, torch.float16, vae_model=vae_model)
+
+        # Run flashvsr - FlashVSR applies the scale factor internally
+        output = flashvsr(
+            pipe, frames, scale, color_fix, color_fix_method,
+            tiled_vae, tiled_dit, 256, 24, True,
+            2.0, 3.0, 11, seed,
+            keep_models_on_cpu, enable_debug,
+            chunk_size=0, resize_factor=1.0, mode=mode
+        )
+
+        # Return first frame as image output
+        return (output[0:1].cpu().float(),)
+
+
+class FlashVSRNodeBatchPath:
+    """
+    Batch video processing loader for FlashVSR.
+    Loads all videos from a directory and iterates through them.
+    Combined with FlashVSR Ultra-Fast node for batch processing.
+    """
+    import os
+    import glob as _glob
+
+    _counter = {}
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        video_extensions = ['mp4', 'webm', 'mkv', 'gif', 'mov', 'avi']
+        return {
+            "required": {
+                "video_dir": ("STRING", {
+                    "default": "",
+                    "tooltip": "Directory containing video files to process."
+                }),
+                "seed": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 112589990684264,
+                    "tooltip": "Random seed for noise generation."
+                }),
+                "reset_counter": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Set to True to reset the counter to 0 (start from first video)."
+                }),
+                "video_extension": (["mp4", "webm", "mkv", "gif", "mov", "avi", "all"], {
+                    "default": "all",
+                    "tooltip": "Filter videos by extension. 'all' processes all video types."
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "INT", "INT", "STRING")
+    RETURN_NAMES = ("image", "frame_count", "seed", "filename")
+    FUNCTION = "main"
+    CATEGORY = "FlashVSR"
+    DESCRIPTION = "Batch video path loader. Iterates through all videos in a directory. Connect output to FlashVSR node."
+
+    def main(self, video_dir, seed, reset_counter, video_extension):
+        if not video_dir:
+            raise ValueError("video_dir is required for FlashVSRNodeBatchPath")
+
+        # Normalize path
+        video_dir = os.path.expanduser(video_dir)
+
+        # Get video files
+        if video_extension == "all":
+            patterns = ['*.mp4', '*.webm', '*.mkv', '*.gif', '*.mov', '*.avi']
+        else:
+            patterns = [f'*.{video_extension}']
+
+        video_files = []
+        for pattern in patterns:
+            video_files.extend(self._glob.glob(os.path.join(video_dir, pattern)))
+            video_files.extend(self._glob.glob(os.path.join(video_dir, pattern.upper())))
+        video_files = sorted(set(video_files))
+
+        if not video_files:
+            raise ValueError(f"No video files found in: {video_dir}")
+
+        # Handle counter
+        key = os.path.normpath(video_dir)
+        if reset_counter or key not in self._counter:
+            self._counter[key] = 0
+        if reset_counter:
+            self._counter[key] = 0
+
+        idx = self._counter[key] % len(video_files)
+        selected_path = video_files[idx]
+        self._counter[key] = (idx + 1) % len(video_files)
+
+        filename = os.path.basename(selected_path)
+        log(f"[Batch] Processing {idx+1}/{len(video_files)}: {filename}", message_type='info', icon="🎬")
+
+        # Load video frames using cv2
+        try:
+            import cv2
+            cap = cv2.VideoCapture(selected_path)
+            frames_list = []
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                # BGR → RGB
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames_list.append(frame)
+            cap.release()
+        except Exception as e:
+            raise RuntimeError(f"Failed to load video {selected_path}: {e}")
+
+        if not frames_list:
+            raise RuntimeError(f"Video has no frames: {selected_path}")
+
+        # Convert to tensor (N, H, W, C)
+        import numpy as np
+        frames_tensor = torch.from_numpy(np.stack(frames_list)).float() / 255.0  # (N, H, W, C)
+
+        return (frames_tensor, len(frames_list), seed, filename)

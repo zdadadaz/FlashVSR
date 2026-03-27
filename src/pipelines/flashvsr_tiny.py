@@ -327,6 +327,7 @@ class FlashVSRTinyPipeline(BasePipeline):
         kv_ratio=3.0,
         local_range = 9,
         color_fix = True,
+        color_fix_method = 'wavelet',
         unload_dit = False,
         force_offload = False,
         enable_debug_logging = False,
@@ -526,7 +527,7 @@ class FlashVSRTinyPipeline(BasePipeline):
                         cond=cur_LQ_frame
                     ).transpose(1, 2).mul_(2).sub_(1)
 
-                # 颜色校正（wavelet）
+                # 颜色校正
                 try:
                     if color_fix:
                         cur_frames = self.ColorCorrector(
@@ -534,7 +535,7 @@ class FlashVSRTinyPipeline(BasePipeline):
                             cur_LQ_frame,
                             clip_range=(-1, 1),
                             chunk_size=16,
-                            method='adain'
+                            method=color_fix_method
                         ).to('cpu') # Ensure back to CPU
                 except:
                     pass
