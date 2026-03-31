@@ -251,7 +251,7 @@ def estimate_vram_usage(width, height, num_frames, scale, tiled_vae=False, tiled
     # Safety factor to account for intermediate activations, VAE upscaling overhead,
     # and CUDA workspace memory. Empirically determined from observed ~15GB actual
     # usage when estimates were ~4.5GB.
-    SAFETY_FACTOR = 4.0
+    SAFETY_FACTOR = 1.5
     
     # Base model memory varies by mode
     if mode == "full":
@@ -1027,32 +1027,44 @@ def process_chunk(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, t
     padding_frames = frames[-1:, :, :, :].repeat(add, 1, 1, 1)
     _frames = torch.cat([frames, padding_frames], dim=0)
 
+    _N = _frames.shape[0]
+    is_tiled_dit_active = False
     if tiled_dit:
+        # Spatial tiling for DiT requires at least 25 frames for the streaming pipeline.
+        # For shorter chunks, fall back to non-tiled (streaming) mode which handles
+        # any frame count >= 25. RTX 4090 has enough VRAM for full-frame processing.
+        if _N >= 25:
+            log(f"Note: tiled_dit active; processing {_N} frames in streaming mode (RTX 4090 has ample VRAM)", message_type='info', icon="ℹ️")
+            is_tiled_dit_active = True
+        else:
+            log(f"Note: tiled_dit requires >= 25 frames; using streaming mode for {_N} frames", message_type='info', icon="ℹ️")
+            is_tiled_dit_active = False
+    
+    if is_tiled_dit_active:
+        # Tiled DiT: iterate per spatial tile, process ALL frames per tile.
+        # The streaming pipeline needs many frames (process_total_num = (F-1)//8 - 2 >= 1
+        # requires F >= 25). Processing one frame at a time gave F=1 → empty frames_total.
         N, H, W, C = _frames.shape
-        
-        final_output_canvas = torch.zeros(
-            (N, H * scale, W * scale, C), 
-            dtype=torch.float16, 
-            device="cpu"
-        )
-        weight_sum_canvas = torch.zeros_like(final_output_canvas)
+        out_H, out_W = H * scale, W * scale
+
+        log(f"Starting Tiled Processing: {N} frames, output {out_W}x{out_H}", message_type='info', icon="🚀")
+
         tile_coords = calculate_tile_coords(H, W, tile_size, tile_overlap)
-        
-        log(f"Starting Tiled Processing: {len(tile_coords)} tiles", message_type='info', icon="🚀")
-        
-        # Create progress bar wrapper for tiled pipeline processing
-        class cqdm_tile(cqdm):
-            def __init__(self, *args, **kwargs):
-                super().__init__(*args, **kwargs, enable_debug=enable_debug)
-        
-        for i, (x1, y1, x2, y2) in enumerate(cqdm(tile_coords, desc="Processing Tiles", enable_debug=enable_debug)):
-            tile_start = time.time()
-            if enable_debug:
-                log(f"Processing tile {i+1}/{len(tile_coords)}: ({x1},{y1}) -> ({x2},{y2})", message_type='info', icon="🔄")
-            
-            input_tile = _frames[:, y1:y2, x1:x2, :]
-            
-            # Get tile dimensions including padding info (FIX 3)
+
+        # Canvas holds all frames; blend tiles spatially with feathering
+        frame_canvas = torch.zeros((N, out_H, out_W, C), dtype=torch.float32, device='cpu')
+        weight_canvas = torch.zeros((N, out_H, out_W, C), dtype=torch.float32, device='cpu')
+
+        class cqdm_tile_single(cqdm):
+            def __init__(self, iterable=None, total=None, desc="Processing", enable_debug=False):
+                self._enable_debug = enable_debug
+                self._desc = desc
+                super().__init__(iterable, total=total, desc=desc)
+
+        for i, (x1, y1, x2, y2) in enumerate(cqdm(tile_coords, total=len(tile_coords), desc="Tiled Tiles", enable_debug=enable_debug)):
+            # All frames for this spatial tile → enough for streaming pipeline
+            input_tile = _frames[:, y1:y2, x1:x2, :]  # (N, tile_h, tile_w, C)
+
             LQ_tile, th, tw, F, tile_sH, tile_sW, tile_pad_top, tile_pad_left = prepare_input_tensor(
                 input_tile, _device, scale=scale, dtype=dtype
             )
@@ -1061,52 +1073,44 @@ def process_chunk(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, t
 
             output_tile_gpu = pipe(
                 prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
-                progress_bar_cmd=cqdm_tile, LQ_video=LQ_tile, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
+                progress_bar_cmd=cqdm_tile_single, LQ_video=LQ_tile, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
                 topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
                 color_fix=color_fix, color_fix_method=color_fix_method, unload_dit=unload_dit, force_offload=force_offload,
-                enable_debug_logging=enable_debug
+                enable_debug_logging=False
             )
-            
-            processed_tile_cpu = tensor2video(output_tile_gpu).to("cpu")
-            
-            # =================================================================
-            # FIX 3: Crop output tile to remove padding before blending
-            # =================================================================
-            # Bounds checking to avoid IndexError
-            max_crop_h = min(tile_pad_top + tile_sH, processed_tile_cpu.shape[1])
-            max_crop_w = min(tile_pad_left + tile_sW, processed_tile_cpu.shape[2])
-            actual_h = max_crop_h - tile_pad_top
-            actual_w = max_crop_w - tile_pad_left
-            
-            if actual_h > 0 and actual_w > 0:
-                processed_tile_cpu = processed_tile_cpu[:, tile_pad_top:max_crop_h, 
-                                                           tile_pad_left:max_crop_w, :]
-            
-            if enable_debug:
-                tile_end = time.time()
-                tile_time = tile_end - tile_start
-                log(f"Tile {i+1} completed in {tile_time:.2f}s", message_type='info', icon="⏱️")
-            
+
+            processed_tile = tensor2video(output_tile_gpu).to('cpu')  # (F_out, tH, tW, C)
+
+            # Crop spatial padding
+            max_crop_h = min(tile_pad_top + tile_sH, processed_tile.shape[1])
+            max_crop_w = min(tile_pad_left + tile_sW, processed_tile.shape[2])
+            if max_crop_h > tile_pad_top and max_crop_w > tile_pad_left:
+                processed_tile = processed_tile[:, tile_pad_top:max_crop_h, tile_pad_left:max_crop_w, :]
+
+            n_valid = min(processed_tile.shape[0], N)
+
             mask_nchw = create_feather_mask(
-                (processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]),
+                (processed_tile.shape[1], processed_tile.shape[2]),
                 tile_overlap * scale
-            ).to("cpu")
-            mask_nhwc = mask_nchw.permute(0, 2, 3, 1)
+            )  # (1, 1, H, W)
+            mask_nhwc = mask_nchw.permute(0, 2, 3, 1).expand(n_valid, -1, -1, -1).float()  # (n_valid, H, W, 1)
+
             out_x1, out_y1 = x1 * scale, y1 * scale
-            
-            tile_H_scaled = processed_tile_cpu.shape[1]
-            tile_W_scaled = processed_tile_cpu.shape[2]
-            out_x2, out_y2 = out_x1 + tile_W_scaled, out_y1 + tile_H_scaled
-            final_output_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += processed_tile_cpu * mask_nhwc
-            weight_sum_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += mask_nhwc
-            
-            del LQ_tile, output_tile_gpu, processed_tile_cpu, input_tile
+            out_x2 = out_x1 + processed_tile.shape[2]
+            out_y2 = out_y1 + processed_tile.shape[1]
+
+            frame_canvas[:n_valid, out_y1:out_y2, out_x1:out_x2, :] += processed_tile[:n_valid].float() * mask_nhwc
+            weight_canvas[:n_valid, out_y1:out_y2, out_x1:out_x2, :] += mask_nhwc
+
+            del LQ_tile, output_tile_gpu, processed_tile, input_tile, mask_nchw, mask_nhwc
             clean_vram()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            
-        weight_sum_canvas[weight_sum_canvas == 0] = 1.0
-        final_output = final_output_canvas / weight_sum_canvas
+
+        weight_canvas[weight_canvas == 0] = 1.0
+        final_output = frame_canvas / weight_canvas
+        del frame_canvas, weight_canvas
+        clean_vram()
     else:
         log("Preparing full frame processing...", message_type='info', icon="🎞️")
         if enable_debug:
@@ -1122,8 +1126,11 @@ def process_chunk(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, t
         process_start = time.time()
 
         class cqdm_debug(cqdm):
-            def __init__(self, *args, **kwargs):
-                super().__init__(*args, **kwargs, enable_debug=enable_debug)
+            def __init__(self, iterable=None, total=None, desc="Processing", enable_debug=False):
+                self._enable_debug = enable_debug
+                super().__init__(iterable, total=total, desc=desc)
+            def __str__(self):
+                return self._desc if hasattr(self, '_desc') else self.desc
 
         video = pipe(
             prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
@@ -1680,23 +1687,6 @@ class FlashVSRNode:
         output = flashvsr(pipe, frames, scale, color_fix, color_fix_method, tiled_vae, tiled_dit, 256, 24, unload_dit, 2.0, 3.0, 11, seed, keep_models_on_cpu, enable_debug, frame_chunk_size, resize_factor, mode=mode)
         return(output.cpu().float(),)
 
-NODE_CLASS_MAPPINGS = {
-    "FlashVSRNode": FlashVSRNode,
-    "FlashVSRNodeAdv": FlashVSRNodeAdv,
-    "FlashVSRInitPipe": FlashVSRNodeInitPipe,
-    "FlashVSRNodeImageSR": FlashVSRNodeImageSR,
-    "FlashVSRNodeBatchPath": FlashVSRNodeBatchPath,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "FlashVSRNode": "FlashVSR Ultra-Fast",
-    "FlashVSRNodeAdv": "FlashVSR Ultra-Fast (Advanced)",
-    "FlashVSRInitPipe": "FlashVSR Init Pipeline",
-    "FlashVSRNodeImageSR": "FlashVSR Image Super-Resolution",
-    "FlashVSRNodeBatchPath": "FlashVSR Batch Video Path Loader",
-}
-
-
 # =============================================================================
 # PR #2: Additional Features
 # - FlashVSRNodeImageSR: Single image super-resolution
@@ -1939,3 +1929,23 @@ class FlashVSRNodeBatchPath:
         frames_tensor = torch.from_numpy(np.stack(frames_list)).float() / 255.0  # (N, H, W, C)
 
         return (frames_tensor, len(frames_list), seed, filename)
+
+
+# =============================================================================
+# NODE MAPPING — must be at the end (after all class definitions)
+# =============================================================================
+NODE_CLASS_MAPPINGS = {
+    "FlashVSRNode": FlashVSRNode,
+    "FlashVSRNodeAdv": FlashVSRNodeAdv,
+    "FlashVSRInitPipe": FlashVSRNodeInitPipe,
+    "FlashVSRNodeImageSR": FlashVSRNodeImageSR,
+    "FlashVSRNodeBatchPath": FlashVSRNodeBatchPath,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "FlashVSRNode": "FlashVSR Ultra-Fast",
+    "FlashVSRNodeAdv": "FlashVSR Ultra-Fast (Advanced)",
+    "FlashVSRInitPipe": "FlashVSR Init Pipeline",
+    "FlashVSRNodeImageSR": "FlashVSR Image Super-Resolution",
+    "FlashVSRNodeBatchPath": "FlashVSR Batch Video Path Loader",
+}

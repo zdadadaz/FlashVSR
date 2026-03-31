@@ -150,6 +150,13 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
         help='Disable color correction.'
     )
     parser.add_argument(
+        '--color_fix_method',
+        type=str,
+        choices=['wavelet', 'adain'],
+        default='wavelet',
+        help='Color correction method. "wavelet": no ghosting artifacts (recommended). "adain": adaptive instance normalization, may cause slight ghosting. (default: wavelet)'
+    )
+    parser.add_argument(
         '--tiled_vae',
         action='store_true',
         default=False,
@@ -194,9 +201,9 @@ For more information, visit: https://github.com/naxci1/ComfyUI-FlashVSR_Stable
     parser.add_argument(
         '--local_range',
         type=int,
-        choices=[9, 11],
-        default=11,
-        help='Local attention range window. 9 = sharper details; 11 = more stable/consistent results. (default: 11)'
+        choices=[7, 9, 11],
+        default=9,
+        help='Local attention range window. 7 = sharpest details; 9 = balanced; 11 = most stable/consistent results. (default: 9)'
     )
     parser.add_argument(
         '--seed',
@@ -368,61 +375,51 @@ class VideoReader:
 
 class VideoWriter:
     """
-    Incremental video writer.
+    Incremental video writer using PyAV (H.264 in MP4).
+    Produces a properly finalized MP4 with the moov atom written on release().
     """
     def __init__(self, output_path, fps, width, height, codec='libx264', crf=18):
-        import cv2
+        import av
         self.output_path = output_path
         self.width = width
         self.height = height
-        self.codec = codec
-        self.crf = crf
-        
-        # Ensure output directory exists
+        self._av = av
+        self._released = False
+
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-        
-        # Determine codec fourcc
-        if codec in ['libx264', 'h264']:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v') # mp4v is safer for general compatibility without ffmpeg specifically
-        elif codec in ['libx265', 'hevc']:
-            fourcc = cv2.VideoWriter_fourcc(*'hvc1')
-        else:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            
-        self.out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-        
-        if not self.out.isOpened():
-             print("Warning: cv2.VideoWriter failed to open with default flags. Trying 'mp4v'.")
-             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-             self.out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-             if not self.out.isOpened():
-                raise RuntimeError(f"Failed to create output video: {output_path}")
+
+        self.container = av.open(output_path, mode='w', options={'movflags': 'faststart'})
+        enc = codec if codec in ('libx264', 'h264', 'libx265', 'hevc', 'h264_nvenc') else 'libx264'
+        self.stream = self.container.add_stream(enc, rate=int(fps))
+        self.stream.width = width
+        self.stream.height = height
+        self.stream.pix_fmt = 'yuv420p'
+        self.stream.options = {'crf': str(crf), 'preset': 'fast'}
 
     def write(self, frames_tensor):
         import torch
         import numpy as np
-        import cv2
-        
-        # Convert tensor to numpy
+        av = self._av
+
         if isinstance(frames_tensor, torch.Tensor):
             frames_np = frames_tensor.cpu().numpy()
         else:
             frames_np = frames_tensor
-        
-        # Ensure values are in [0, 1] and convert to uint8
+
         frames_np = np.clip(frames_np, 0.0, 1.0)
         frames_np = (frames_np * 255).astype(np.uint8)
-        
-        n_frames = frames_np.shape[0]
-        
-        for i in range(n_frames):
-            # Convert RGB to BGR for OpenCV
-            frame_bgr = cv2.cvtColor(frames_np[i], cv2.COLOR_RGB2BGR)
-            self.out.write(frame_bgr)
-            
+
+        for i in range(frames_np.shape[0]):
+            frame = av.VideoFrame.from_ndarray(frames_np[i], format='rgb24')
+            for packet in self.stream.encode(frame):
+                self.container.mux(packet)
+
     def release(self):
-        if self.out:
-            self.out.release()
+        if not self._released and self.container:
+            self._released = True
+            for packet in self.stream.encode():
+                self.container.mux(packet)
+            self.container.close()
 
 def format_time(seconds):
     """
@@ -607,6 +604,7 @@ def main():
                 frames=frames,
                 scale=args.scale,
                 color_fix=color_fix,
+                color_fix_method=args.color_fix_method,
                 tiled_vae=args.tiled_vae,
                 tiled_dit=args.tiled_dit,
                 tile_size=args.tile_size,
