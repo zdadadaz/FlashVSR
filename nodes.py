@@ -754,7 +754,7 @@ def calculate_tile_coords(height, width, tile_size, overlap):
 def create_feather_mask(size, overlap):
     H, W = size
     mask = torch.ones(1, 1, H, W)
-    ramp = torch.linspace(0, 1, overlap)
+    ramp = (1 - torch.cos(torch.linspace(0, math.pi, overlap))) / 2
     
     mask[:, :, :, :overlap] = torch.minimum(mask[:, :, :, :overlap], ramp.view(1, 1, 1, -1))
     mask[:, :, :, -overlap:] = torch.minimum(mask[:, :, :, -overlap:], ramp.flip(0).view(1, 1, 1, -1))
